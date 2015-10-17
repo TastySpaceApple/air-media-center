@@ -1,0 +1,15 @@
+{
+  "name": "air-media-center",
+  "version": "1.0.0",
+  "description": "airplay any local file with subtitles",
+  "main": "app.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "mdns-js": "^0.4.0",
+    "opensubtitles-api": "^1.3.1"
+  }
+}

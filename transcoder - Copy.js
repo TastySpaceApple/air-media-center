@@ -136,7 +136,13 @@ TranscodingServer.prototype.stop = function() {
 	self.started=false;
 	// close open clients
 	for (var key in self.clients) self.clients[key].destroy();
-	
+	// kill transcoder, and stop watching segment file
+	if(self.ffmpeg){
+	  fs.unwatchFile(path.join(self.config.workdir,'segments.csv'));
+	  self.ffmpeg.kill();
+	}
+	// delete segments.csv
+	fs.unlink(path.join(self.config.workdir,'segments.csv'), function (err) {});				
 	// delete segment files	
 	for (var c=0;c<self.segments.length;c++){
 		var curr=self.segments[c];
@@ -173,32 +179,114 @@ TranscodingServer.prototype.probeInput=function() {
 					index: c,
 					outfile: 'segment'+c+'.ts',
 					timestart: c*self.config.segmentsize,
-					timelength: Math.min(self.duration,(c+1)*self.config.segmentsize)-c*self.config.segmentsize,
-					finished: false,
-					working: false
+					timelength: Math.min(self.duration,(c+1)*self.config.segmentsize)-c*self.config.segmentsize
 				};
 				self.segments.push(config);
 			}
-			self.start();
+			var customdst=path.join(self.config.workdir,path.basename(self.config.customsubtitle));
+			var onsubtitleconvert=function(err){
+				self.segmentlistsize=-1;
+				self.ffmpeg=self.runTranscoder({ onfinish: function(){ 
+					var stats=fs.statSync(path.join(self.config.workdir,'segments.csv'));
+					self.segmentlistsize=stats["size"];
+				} });
+				self.monitorSegments();
+				self.start();
+			}
+			onsubtitleconvert();
+			//
+			/*self.convertSubs(self.config.customsubtitle,customdst,self.config.language,function(err){
+				if(self.config.subtitle){ 
+					var defsub=path.join(self.config.workdir,self.config.subtitle);
+					self.convertSubs(defsub,defsub,self.config.language,onsubtitleconvert);
+				}else{
+					onsubtitleconvert(err);
+				}
+			});*/
 		}
 	});
 }
+
+TranscodingServer.prototype.monitorSegments=function() {
+	var self=this;
+	var fs = require('fs');	
+	var path = require('path');	
+	var infoFile=path.join(self.config.workdir,'segments.csv');
+	var startTime = new Date();	
+	var regex=/(segment(\d+).ts,([0-9.]+),([0-9.]+))\n/
+	var buffer="";
+	var last=0;
+	fs.watchFile(infoFile, function(val) {
+		if(val.size<=last) return;
+		rs=fs.createReadStream(infoFile, {start: last, end: val.size});
+		// add data to buffer
+		rs.on('data', function (chunk) { buffer+=chunk.toString('utf8'); });
+		// when all data is read parse
+		rs.on('end', function() {
+			var match = regex.exec(buffer);
+			while (match != null) {
+				var index=parseInt(match[2]);
+				var stats=fs.statSync(path.join(self.config.workdir,self.segments[index].outfile));
+				self.segments[index].filelength=stats["size"];
+				// calculate average
+				var endTime = new Date();
+				var timeDiff = (endTime - startTime)/(index+1);
+				self.averagetime=timeDiff/1000;
+				// remove line
+				buffer=buffer.substring(match[0].length);
+				match = regex.exec(buffer);
+			}	
+			if(val.size==self.segmentlistsize){
+				console.log('TranscodingServer - Transcode finished, completed '+self.msToTime(self.duration*1000)+' in '+self.msToTime(endTime - startTime));
+				fs.unwatchFile(infoFile);
+			}else{
+				last=val.size;
+			}
+		});		
+	});
+}
+/*
+TranscodingServer.prototype.convertSubs=function(srcfile,outfile,language,onfinish) {
+	var fs = require('fs');	
+	var path = require('path');	
+	var self=this;
+	// check if subtitle exists
+	if(!srcfile){
+		if(onfinish) onfinish(new Error('TranscodingServer: Subtitle file not set'));
+	}else if(!fs.existsSync(srcfile)){
+		if(onfinish) onfinish(new Error('TranscodingServer: Subtitle '+srcfile+' does not exist'));
+	}else if(!self.config.language){
+		if(onfinish) onfinish(new Error('TranscodingServer: Language for subtitle '+srcfile+' not set'));
+	}else{
+		console.log('TranscodingServer: Converting subtitle '+path.basename(srcfile)+' to UTF8');
+		fs.readFile(srcfile, function (err, data) {
+			if (err){
+				if(onfinish) onfinish(err);
+			}else{		
+				App.Subtitles.Generic.decode(data,self.config.language,function(decoded){
+					fs.writeFile(outfile, decoded, function (err) {
+						console.log('TranscodingServer: Saved UTF8 subtitle as '+outfile);
+						if(onfinish) onfinish(err);				
+					});					
+				});
+			}
+		});			
+	}
+}*/
 
 TranscodingServer.prototype.createSegmentTS=function(index,res) {
 	var path = require('path');	
 	var self=this;
 	var segment=self.segments[index];
-	this.transcodeSegmentTS(segment);
 	//
 	if(!segment){
 		if(res) self.createNotFound(res,'/segment'+index+'.ts');				
 	}else if(segment.filelength){
 		if(res){ 
-			fs.createReadStream( path.join(self.config.workdir, segment.outfile) ).pipe( res );
-			/*fs.readFile(path.join(self.config.workdir, segment.outfile),function(err,data){
+			fs.readFile(path.join(self.config.workdir,segment.outfile),function(err,data){
 				res.writeHead(200, {'Content-Type': 'video/MP2T','Content-Length': segment.filelength });										
 				res.end(data);
-			});		*/
+			});		
 		}
 	}else{ 
 		setTimeout(function(){ self.createSegmentTS(segment.index,res); },1000);									
@@ -234,6 +322,62 @@ TranscodingServer.prototype.createFullVTT=function(filename,res) {
 		}
 		res.end();
 	});			
+}
+
+TranscodingServer.prototype.createInfo=function(res) {
+	var self=this;
+	//
+	res.writeHead(200, {'Content-Type': 'text/html'});							
+	res.write('<html>');
+	res.write('<head><title>Transcoding Server</title></head>');
+	res.write('<body>');
+	// server information
+	res.write('<h1>Server Information</h1>');			
+	res.write('<p>To test the transcoder click <a href="/transcode-test">here</a></p>');				
+	res.write('<table border="1">');			
+	for(var key in self.config) res.write('<tr><td>'+key+'</td><td>'+self.config[key]+'</td></tr>');	
+	res.write('<tr><td>averagetranscode</td><td>'+self.averagetime+'</td></tr>');	
+	res.write('</table>');			
+	// video information
+	res.write('<h1>Video Information</h1>');			
+	res.write('<table border="1">');			
+	res.write('<tr><td>video_codec</td><td>'+self.video_codec+'</td></tr>');							
+	res.write('<tr><td>audio_codec</td><td>'+self.audio_codec+'</td></tr>');								
+	res.write('<tr><td>width</td><td>'+self.width+'</td></tr>');						
+	res.write('<tr><td>height</td><td>'+self.height+'</td></tr>');						
+	res.write('<tr><td>bitrate</td><td>'+self.bitrate+'</td></tr>');		
+	res.write('<tr><td>duration</td><td>'+self.msToTime(self.duration*1000)+'</td></tr>');
+	res.write('<tr><td>duration(ms)</td><td>'+self.duration+'</td></tr>');
+	res.write('</table>');			
+	// connected clients
+	res.write('<h1>Connected clients</h1>');			
+	res.write('<table border="1">');			
+	res.write('<tr><td>ADDRESS</td></tr>');			
+	for (var key in self.clients){
+		res.write('<tr><td>'+key+'</td></tr>');			
+	}
+	res.write('</table>');			
+	// segment information
+	res.write('<h1>Segments</h1>');			
+	res.write('<table border="1">');			
+	res.write('<tr>');			
+	res.write('<td>INDEX</td><td>VIDEO</td><td>START</td><td>SIZE</td>');			
+	res.write('</tr>');			
+	for (var c=0;c<self.segments.length;c++){
+		res.write('<tr>');
+		res.write('<td valign="top">'+c+'</td>');
+		res.write('<td valign="top">/segment'+c+'.ts</td>');
+		res.write('<td valign="top">'+self.msToTime(self.segments[c].timestart*1000)+'</td>');
+		if(self.segments[c].filelength){
+			res.write('<td valign="top">'+self.segments[c].filelength+'</td>');			
+		}else{
+			res.write('<td valign="top">NOT READY</td>');			
+		}
+		res.write('</tr>');
+	}
+	res.write('</table>');			
+	//
+	res.end();
 }
 
 TranscodingServer.prototype.createListVTT=function(filename,res) {
@@ -325,14 +469,173 @@ TranscodingServer.prototype.createNotFound=function(res,url) {
 	res.end();
 }
 
-TranscodingServer.prototype.createTranscoderArgs=function(segment){
+TranscodingServer.prototype.createTest=function(res) {
+	var path = require('path');
+	var self=this;
+	var buffer='';
+	// ok, it exists test transcoder
+	var startTime = new Date().getTime();
+	self.runTranscoder({
+		outfile: 'test.ts',
+		timestart: 0,
+		onstderr:function(data){
+			buffer+=data.toString('utf8');
+		},
+		onerror:function(){
+			var endTime = new Date().getTime();
+			var args=self.createTranscoderArgs({ outfile: 'test.ts', timestart: 0});
+			// delete the test file
+			fs.unlink(path.join(self.config.workdir,'test.ts'), function (err) {});				
+			// create response
+			res.writeHead(200, {'Content-Type': 'text/html'});							
+			res.write('<html>');
+			res.write('<head><title>Transcoding Server</title></head>');
+			res.write('<body>');
+			res.write('<h1>FFMPEG Test</h1>');
+			res.write('<table>');
+			res.write('<tr><td>Transcoded first 10 seconds of the video in '+Math.round((endTime-startTime)/1000)+' seconds using '+self.config.ffmpegthreads+' threads.</td></tr>');
+			res.write('<tr><td><strong>COMMAND:</strong></td></tr>');		
+			res.write('<tr><td><code>ffmpeg ');		
+			for(var c=0;c<args.length;c++) res.write(args[c]+' ');		
+			res.write('</code></td></tr>');		
+			res.write('<tr><td><strong>OUTPUT:</strong></td></tr>');		
+			res.write('<tr><td><code>'+buffer.replace(/\r/g, '<br/>')+'</code></td></tr>');		
+			res.write('</table>');
+			res.write('</body>');
+			res.write('</html>');
+			res.end();
+		},
+		onfinish:function(){
+			var endTime = new Date().getTime();
+			var args=self.createTranscoderArgs({ outfile: 'test.ts', timestart: 0});
+			// delete the test file
+			fs.unlink(path.join(self.config.workdir,'test.ts'), function (err) {});				
+			// create response
+			res.writeHead(200, {'Content-Type': 'text/html'});							
+			res.write('<html>');
+			res.write('<head><title>Transcoding Server</title></head>');
+			res.write('<body>');
+			res.write('<h1>FFMPEG Test</h1>');
+			res.write('<table>');
+			res.write('<tr><td>Transcoded first 10 seconds of the video in '+Math.round((endTime-startTime)/1000)+' seconds using '+self.config.ffmpegthreads+' threads.</td></tr>');
+			res.write('<tr><td><strong>COMMAND:</strong></td></tr>');		
+			res.write('<tr><td><code>ffmpeg ');		
+			for(var c=0;c<args.length;c++) res.write(args[c]+' ');		
+			res.write('</code></td></tr>');		
+			res.write('<tr><td><strong>OUTPUT:</strong></td></tr>');		
+			res.write('<tr><td><code>'+buffer.replace(/\r/g, '<br/>')+'</code></td></tr>');		
+			res.write('</table>');
+			res.write('</body>');
+			res.write('</html>');
+			res.end();
+		}
+	});
+};
+
+TranscodingServer.prototype.createTranscoderArgs=function(param){
+/*
+	var args=new Array();
+
+	// overwrite files
+	args.push('-y'); 
+	// input file
+	args.push('-i'); 
+	args.push(this.config.infile); 
+	// force key frames every 2 seconds
+	args.push('-r');
+	args.push('30');
+	args.push('-force_key_frames');
+	args.push('expr:gte(t,n_forced*1)');
+	// audio options
+	args.push('-strict');
+	args.push('-2');
+	//args.push('-c:a');
+	//args.push(this.config.ffmpegaudioenc);
+	args.push('-q:a');
+	args.push('0');
+	// video options
+ 	//args.push('-c:v');
+	//args.push('libx264');
+	args.push('-profile:v');
+	args.push('main');
+	args.push('-q:v');
+	args.push('0');
+	args.push('-preset');
+	args.push(this.config.ffmpegpreset);
+	
+	var h = ['-c:v', 'linx264',
+     '-c:a', 'aac',
+            // '-g', 100,
+            // '-vcodec', 'copy',
+            // '-acodec', 'copy',
+            '-b', '500k',
+            '-ac', '2',
+            '-ar', '44100',
+            '-ab', '32k']
+			
+	for(var i in h){
+		args.push[h[i]];
+	}
+			
+	// subtitles
+	if(this.config.hardcodesubs==true){
+		var customsub=path.basename(this.config.customsubtitle);
+		if(this.config.customsubtitle && fs.existsSync(path.join(this.config.workdir,customsub))){
+			args.push('-vf');
+			if(this.config.style && this.config.style.trim()!=""){ 
+				args.push('subtitles='+customsub+':force_style=\''+this.config.style+'\'');
+			}else{
+				args.push('subtitles='+customsub);		
+			}
+		}else if(this.config.subtitle && fs.existsSync(path.join(this.config.workdir,this.config.subtitle))){
+			args.push('-vf');
+			if(this.config.style && this.config.style.trim()!=""){ 
+				args.push('subtitles='+this.config.subtitle+':force_style=\''+this.config.style+'\'');
+			}else{
+				args.push('subtitles='+this.config.subtitle);		
+			}
+		}
+	}
+	// threads to use to transcode
+	if(this.config.ffmpegthreads){
+		args.push('-threads');		
+		args.push(this.config.ffmpegthreads);		
+	}else{
+		args.push('-threads');		
+		args.push(2);		
+	}
+	// output file format
+	if(typeof param.timestart!='undefined'){
+		args.push('-ss');
+		args.push(param.timestart);
+		args.push('-t');
+		args.push(this.config.segmentsize);
+		args.push('-f');
+		args.push('mpegts');
+		args.push(param.outfile);		
+	}else{
+		args.push('-f');
+		args.push('stream_segment');
+		args.push('-segment_list');
+		args.push('segments.csv');
+		args.push('-segment_time');
+		args.push(this.config.segmentsize);
+		args.push('-segment_time_delta');
+		args.push('0.01');
+		//args.push('-reset_timestamps');
+		//args.push('1');
+		args.push('segment%d.ts');
+	}
+	console.log(args.join(" "));
+	//
+	return(args);
+*/
 	var opt = [
         '-y',
         '-i',
-        this.config.infile,
+        this.file,
         '-t', this.config.segmentsize,
-        '-ss', this.config.segmentsize * (segment.index),
-		'-preset', 'veryfast'
+        '-ss', this.config.segmentsize * (1 - 1),
     ];
 
     // h264 && aac
@@ -357,41 +660,9 @@ TranscodingServer.prototype.createTranscoderArgs=function(segment){
             '-ab', '32k'
         ]);
     }
-	
-	opt.push( path.join(this.config.workdir, segment.outfile) );
-	
-	return opt;
+	console.log(opt.join(" "));
 }
-TranscodingServer.prototype.transcodeSegmentTS = function(segment){
-	if(segment.working) return;
-	segment.working = true;
-	var child = require('child_process');
-	var ffmpegPath=path.join(this.config.ffmpegdir, 'ffmpeg');
-	var envs = process.env;
-	var self=this;
-	// environment for ffmpeg
-	envs['FC_CONFIG_DIR'] = path.resolve(this.config.ffmpegdir, 'fonts/');
-	envs['FC_CONFIG_FILE'] = path.resolve(this.config.ffmpegdir, 'fonts/fonts.conf');
-	envs['FONTCONFIG_FILE'] = path.resolve(this.config.ffmpegdir, 'fonts/fonts.conf');
-	envs['FONTCONFIG_PATH'] = path.resolve(this.config.ffmpegdir, 'fonts/'); 			
-	// start ffmpeg
-	var ffmpeg=child.execFile( 
-		ffmpegPath, 
-		self.createTranscoderArgs(segment),
-		{ cwd: self.config.workdir, env: envs },
-		function (error, stdout, stderr) {
-			//
-			
-			if(!error){
-				var stats=fs.statSync(path.join(self.config.workdir, segment.outfile));
-				segment.filelength = stats["size"];
-				segment.finished = true;
-			}else
-				console.log(error);
-			
-		}
-	);
-}
+
 TranscodingServer.prototype.runTranscoder=function(args) {
 	var child = require('child_process');
 	var path = require('path');

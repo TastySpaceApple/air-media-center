@@ -1,1 +1,3 @@
 node_modules
+# avoid sharing config
+config.json
